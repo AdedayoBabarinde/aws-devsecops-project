@@ -1,0 +1,13 @@
+apiVersion: v2
+name: web-app
+description: Production-ready web application with security and monitoring
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - web
+  - devsecops
+  - kubernetes
+maintainers:
+  - name: DevOps Team
+    email: devops@example.com
