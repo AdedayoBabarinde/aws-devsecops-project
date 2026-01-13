@@ -1,0 +1,174 @@
+name: Build, Scan, and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - '.github/workflows/build-scan-push.yml'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: web-app
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+
+  build-and-push:
+    name: Build and Push Image
+    needs: security-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          BRANCH_NAME=${GITHUB_REF##*/}
+          SHORT_SHA=${GITHUB_SHA::7}
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          
+          if [ "$BRANCH_NAME" = "main" ]; then
+            TAG="v${TIMESTAMP}-${SHORT_SHA}"
+          else
+            TAG="${BRANCH_NAME}-${SHORT_SHA}"
+          fi
+          
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "full-tag=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.full-tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VCS_REF=${{ github.sha }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.full-tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Trivy vulnerability scanner (table output)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.full-tag }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Check Trivy scan results
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.full-tag }}
+          format: 'json'
+          output: 'trivy-report.json'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+      - name: Push image to Amazon ECR
+        if: github.event_name == 'push'
+        run: |
+          docker push ${{ steps.meta.outputs.full-tag }}
+          
+          # Tag as latest for main branch
+          if [ "${GITHUB_REF##*/}" = "main" ]; then
+            docker tag ${{ steps.meta.outputs.full-tag }} \
+              ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          fi
+
+      - name: Output image details
+        if: github.event_name == 'push'
+        run: |
+          echo "Image pushed: ${{ steps.meta.outputs.full-tag }}"
+          echo "ECR Repository: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}"
+          echo "Image Tag: ${{ steps.meta.outputs.tag }}"
+          echo "::notice::Image successfully built and pushed to ECR"
+
+      - name: Create deployment artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p artifacts
+          echo "${{ steps.meta.outputs.full-tag }}" > artifacts/image-tag.txt
+          echo "${{ steps.meta.outputs.tag }}" > artifacts/version.txt
+
+      - name: Upload deployment artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-info
+          path: artifacts/
+          retention-days: 30
+
+  notify:
+    name: Notify Build Status
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send notification
+        run: |
+          if [ "${{ needs.build-and-push.result }}" = "success" ]; then
+            echo "✅ Build and scan successful!"
+          else
+            echo "❌ Build or scan failed!"
+          fi

@@ -1,0 +1,155 @@
+name: Deploy to EKS
+
+on:
+  workflow_run:
+    workflows: ["Build, Scan, and Push Docker Image"]
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      image_tag:
+        description: 'Image tag to deploy'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: eu-west-2
+
+jobs:
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download deployment artifact
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-info
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Set image tag
+        id: image
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          elif [ -f "artifacts/version.txt" ]; then
+            echo "tag=$(cat artifacts/version.txt)" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update kubeconfig
+        run: |
+          CLUSTER_NAME="${{ github.event.inputs.environment || 'dev' }}-eks-cluster"
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region ${{ env.AWS_REGION }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.13.0'
+
+      - name: Deploy with Helm
+        working-directory: helm-charts/web-app
+        run: |
+          helm upgrade --install web-app . \
+            --namespace default \
+            --set image.tag=${{ steps.image.outputs.tag }} \
+            --set environment=${{ github.event.inputs.environment || 'dev' }} \
+            --wait \
+            --timeout 5m \
+            --create-namespace
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/web-app-web-app -n default --timeout=5m
+          kubectl get pods -n default -l app.kubernetes.io/name=web-app
+
+      - name: Run smoke tests
+        run: |
+          SERVICE_URL=$(kubectl get ingress web-app-web-app -n default -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Service URL: $SERVICE_URL"
+          
+          # Wait for ALB to be ready
+          sleep 30
+          
+          # Health check
+          for i in {1..10}; do
+            if curl -f "http://$SERVICE_URL/health" --max-time 10; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying..."
+            sleep 10
+          done
+          
+          echo "Health check failed after 10 attempts"
+          exit 1
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Tag:** ${{ steps.image.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pod Status" >> $GITHUB_STEP_SUMMARY
+          kubectl get pods -n default -l app.kubernetes.io/name=web-app >> $GITHUB_STEP_SUMMARY || true
+
+  rollback:
+    name: Rollback on Failure
+    needs: deploy
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          CLUSTER_NAME="${{ github.event.inputs.environment || 'dev' }}-eks-cluster"
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region ${{ env.AWS_REGION }}
+
+      - name: Rollback deployment
+        run: |
+          helm rollback web-app -n default
+          kubectl rollout status deployment/web-app-web-app -n default --timeout=5m
+
+      - name: Notify rollback
+        run: |
+          echo "⚠️ Deployment failed and was rolled back!"
+          echo "::error::Deployment to ${{ github.event.inputs.environment || 'dev' }} failed"
